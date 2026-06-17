@@ -5,6 +5,7 @@ This module defines a sophisticated LangGraph workflow where an AI agent
 makes  decisions about how to analyze a pull request.
 """
 
+import asyncio
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -35,6 +36,9 @@ class AIAnalysisState(TypedDict):
     analysis_results: List[FileAnalysis]
     final_summary: Dict[str, Any]
     llm_service: LLMService
+    # Optional async callback invoked as each file finishes:
+    # await progress_callback(completed: int, total: int, file_path: str)
+    progress_callback: Optional[Any]
 
 
 class AIWorkflow:
@@ -54,29 +58,29 @@ class AIWorkflow:
 
         # Add nodes
         workflow.add_node("triage_pr", self.triage_pr_node)
-        workflow.add_node("file_analysis_loop", self.file_analysis_loop_node)
+        workflow.add_node("analyze_files", self.analyze_files_node)
         workflow.add_node("synthesize_report", self.synthesize_report_node)
 
-        # Define the flow
+        # Define the flow. Files are independent of one another, so they are
+        # analyzed concurrently inside a single node instead of one at a time.
         workflow.set_entry_point("triage_pr")
-        workflow.add_edge("triage_pr", "file_analysis_loop")
-        workflow.add_conditional_edges(
-            "file_analysis_loop",
-            self.should_continue_analysis,
-            {
-                "continue": "file_analysis_loop",
-                "end": "synthesize_report",
-            },
-        )
+        workflow.add_edge("triage_pr", "analyze_files")
+        workflow.add_edge("analyze_files", "synthesize_report")
         workflow.add_edge("synthesize_report", END)
 
         return workflow.compile()
 
     async def run(
-        self, pr_data: Dict[str, Any], files_data: List[Dict[str, Any]]
+        self,
+        pr_data: Dict[str, Any],
+        files_data: List[Dict[str, Any]],
+        progress_callback: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the intelligent analysis workflow.
+
+        ``progress_callback`` is an optional async callable invoked as each file
+        finishes analysis: ``await progress_callback(completed, total, file_path)``.
         """
         llm_service = LLMService()
 
@@ -88,6 +92,7 @@ class AIWorkflow:
             "analysis_results": [],
             "final_summary": {},
             "llm_service": llm_service,
+            "progress_callback": progress_callback,
         }
         final_state = await self.graph.ainvoke(initial_state)
         return self._format_output(final_state)
@@ -125,40 +130,78 @@ class AIWorkflow:
         )
         return state
 
-    async def file_analysis_loop_node(self, state: AIAnalysisState) -> AIAnalysisState:
+    async def analyze_files_node(self, state: AIAnalysisState) -> AIAnalysisState:
         """
-        Analyzes one file at a time, decided by the agent's strategy.
+        Analyze every critical file concurrently.
+
+        Each file is an independent LLM call that does not depend on the others,
+        so they are dispatched together with ``asyncio.gather`` instead of being
+        processed sequentially. Concurrency is bounded by the configured
+        ``max_concurrent_analyses`` to avoid overwhelming the LLM provider.
         """
-        if not state["critical_files"]:
+        critical_files = state["critical_files"]
+        if not critical_files:
             return state
 
-        file_path = state["critical_files"].pop(0)
-        state["current_file_path"] = file_path
-
-        file_data = next(
-            (f for f in state["files_data"] if f.get("filename") == file_path), None
-        )
-        if not file_data or not file_data.get("content"):
-            logger.warning(f"No content found for file {file_path}, skipping analysis.")
-            return state
-
-        logger.info(f"AI is analyzing file: {file_path}")
-        # AI performs a deep analysis using the AI tool
+        files_by_path = {f.get("filename"): f for f in state["files_data"]}
         llm_service = state["llm_service"]
-        issues = await analyze_code_with_ai(
-            llm_service, file_path, file_data["content"]
+        progress_callback = state.get("progress_callback")
+
+        settings = get_settings()
+        max_concurrency = max(1, settings.agent.max_concurrent_analyses)
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        total = len(critical_files)
+        completed = 0
+
+        async def analyze_one(file_path: str) -> Optional[FileAnalysis]:
+            file_data = files_by_path.get(file_path)
+            if not file_data or not file_data.get("content"):
+                logger.warning(
+                    f"No content found for file {file_path}, skipping analysis."
+                )
+                return None
+
+            async with semaphore:
+                logger.info(f"AI is analyzing file: {file_path}")
+                issues = await analyze_code_with_ai(
+                    llm_service, file_path, file_data["content"]
+                )
+            return {"file_path": file_path, "issues": issues}
+
+        async def analyze_and_report(file_path: str) -> Optional[FileAnalysis]:
+            nonlocal completed
+            try:
+                return await analyze_one(file_path)
+            finally:
+                # Report progress on completion regardless of success/failure so
+                # the percentage tracks files processed, not just files that pass.
+                completed += 1
+                if progress_callback is not None:
+                    try:
+                        await progress_callback(completed, total, file_path)
+                    except Exception as cb_error:
+                        logger.warning(f"Progress callback failed: {cb_error}")
+
+        logger.info(
+            f"Analyzing {total} files concurrently (max {max_concurrency} at a time)."
+        )
+        results = await asyncio.gather(
+            *(analyze_and_report(file_path) for file_path in critical_files),
+            return_exceptions=True,
         )
 
-        state["analysis_results"].append({"file_path": file_path, "issues": issues})
-        return state
+        analysis_results: List[FileAnalysis] = []
+        for file_path, result in zip(critical_files, results):
+            if isinstance(result, Exception):
+                logger.error(f"Analysis failed for {file_path}: {result}")
+                continue
+            if result is None:
+                continue
+            analysis_results.append(result)
 
-    def should_continue_analysis(self, state: AIAnalysisState) -> str:
-        """
-        Determines if there are more files to analyze.
-        """
-        if state["critical_files"]:
-            return "continue"
-        return "end"
+        state["analysis_results"] = analysis_results
+        return state
 
     async def synthesize_report_node(self, state: AIAnalysisState) -> AIAnalysisState:
         """
